@@ -1,10 +1,6 @@
 {
   "port": 8790,
   "autoNext": true,
-  "transcode": {
-    "encoder": "auto",
-    "maxHeight": 720
-  },
   "roots": [
     {
       "id": "anime",
