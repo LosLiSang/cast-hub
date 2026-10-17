@@ -3,3 +3,4 @@ data/
 config.json
 config.pi.json
 agent.config.json
+worker.json

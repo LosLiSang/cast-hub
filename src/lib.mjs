@@ -3,6 +3,9 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
+// Bumped whenever worker-side code changes; the hub flags workers running an older copy.
+export const VERSION = '3';
+
 export const MIME = {
   '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mkv': 'video/x-matroska', '.webm': 'video/webm',
   '.avi': 'video/x-msvideo', '.mov': 'video/quicktime', '.ts': 'video/mp2t', '.m2ts': 'video/mp2t',
@@ -13,6 +16,101 @@ export const MIME = {
 };
 export const extOf = (f) => path.extname(String(f)).toLowerCase();
 export const isMedia = (f) => Object.hasOwn(MIME, extOf(f));
+export const SUB_EXT = new Set(['.ass', '.ssa', '.srt', '.vtt']);
+export const isSubFile = (f) => SUB_EXT.has(extOf(f));
+
+// ---------------- subtitles (pure) ----------------
+const LABELS = [
+  [/(^|[.\s_\[(-])(zh-?hans|chs|sc|gb|zh-?cn|jpsc)($|[.\s_\])-])|简|簡/i, '简体中文'],
+  [/(^|[.\s_\[(-])(zh-?hant|cht|tc|big5|zh-?tw|zh-?hk|jptc)($|[.\s_\])-])|繁/i, '繁體中文'],
+  [/(^|[.\s_\[(-])(ja|jp|jpn|japanese)($|[.\s_\])-])|日/i, '日文'],
+  [/(^|[.\s_\[(-])(en|eng|english)($|[.\s_\])-])|英/i, 'English'],
+  [/(^|[.\s_\[(-])(zh|chi|zho|chinese|chs?)($|[.\s_\])-])|中/i, '中文'],
+];
+/** Human label from a filename tag ("zh-Hans"), stream title ("简体中文") or language code ("chi"). */
+export function subLabel(...hints) {
+  for (const h of hints) {
+    const s = String(h || '').trim();
+    if (!s) continue;
+    for (const [re, label] of LABELS) if (re.test(s)) return label;
+  }
+  const first = hints.find((h) => String(h || '').trim());
+  return first ? String(first).trim() : '字幕';
+}
+
+/** Sidecar subtitle files for a video: same basename followed by "." (e.g. "X.zh-Hans.ass", "X.srt"). */
+export function findSidecars(videoName, names) {
+  const base = String(videoName).replace(/\.[^.]+$/, '');
+  return names
+    .filter((n) => isSubFile(n) && n.startsWith(base) && n[base.length] === '.')
+    .sort(natural)
+    .map((n) => {
+      const rest = n.slice(base.length + 1);
+      const tagPart = rest.includes('.') ? rest.replace(/\.[^.]+$/, '') : '';
+      return { id: `ext:${n}`, kind: 'external', name: n, codec: extOf(n).slice(1), label: tagPart ? subLabel(tagPart) : '外挂字幕' };
+    });
+}
+
+export const IMAGE_SUB = new Set(['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub']);
+export const TEXT_SUB = new Set(['ass', 'ssa', 'subrip', 'srt', 'webvtt', 'mov_text', 'text']);
+
+/** Embedded subtitle tracks from a probe summary. `n` = index among subtitle streams (for -map 0:s:n). */
+export function embeddedTracks(probe) {
+  return (probe?.subtitles || [])
+    .filter((s) => TEXT_SUB.has(s.codec) || IMAGE_SUB.has(s.codec))
+    .map((s) => ({ id: `emb:${s.n}`, kind: 'embedded', n: s.n, codec: s.codec, image: IMAGE_SUB.has(s.codec), label: subLabel(s.title, s.lang) }));
+}
+
+// ---------------- workers (pure) ----------------
+export const HW_FAMILIES = ['nvenc', 'qsv', 'amf'];
+export const hasHardware = (w) => HW_FAMILIES.some((f) => w?.caps?.families?.[f]?.h264);
+/** A worker the hub may dispatch transcode jobs to right now. */
+export const workerUsable = (w) => !!(w && w.approved && w.prefs?.enabled !== false && w.online && w.reachable !== false && w.transcode);
+
+/**
+ * Pick the worker for a transcode job.
+ * preferId: 'auto' or a worker id chosen by the user. When that worker is unusable we fall back to auto.
+ * Auto order: hardware encoder first, then fewest running jobs, then the worker that already has the file
+ * (no LAN hop), then most recently seen.
+ */
+export function rankWorkers(workers, { preferId = 'auto', sourceId = null, busy = {} } = {}) {
+  const usable = workers.filter(workerUsable);
+  if (preferId && preferId !== 'auto') {
+    const w = usable.find((x) => x.id === preferId);
+    if (w) return { worker: w, reason: 'manual' };
+  }
+  const sorted = [...usable].sort((a, b) =>
+    (hasHardware(b) - hasHardware(a))
+    || ((busy[a.id] || 0) - (busy[b.id] || 0))
+    || ((b.id === sourceId) - (a.id === sourceId))
+    || ((b.lastSeen || 0) - (a.lastSeen || 0)));
+  if (!sorted.length) return { worker: null, reason: 'none' };
+  return { worker: sorted[0], reason: preferId && preferId !== 'auto' ? 'fallback' : 'auto' };
+}
+
+/** Hub base URL for install scripts, from the browser's Host header. Only plain host[:port] is accepted. */
+export function hubUrlFromHost(host, fallback) {
+  const h = String(host || '').trim();
+  if (/^[A-Za-z0-9.-]+(:\d{1,5})?$/.test(h) || /^\[[0-9A-Fa-f:]+\](:\d{1,5})?$/.test(h)) return `http://${h}`;
+  return fallback;
+}
+
+/** Fill __NAME__ placeholders. Values must be shell/PowerShell-safe (checked by the caller). */
+export function renderTemplate(tpl, vars) {
+  return String(tpl).replace(/__([A-Z]+)__/g, (m, k) => (Object.hasOwn(vars, k) ? String(vars[k]) : m));
+}
+
+/** Default track: keep the user's last label, else 简体 > 中文 > 繁體 > first; external beats embedded at equal label. */
+export function pickDefaultSub(tracks, preferLabel) {
+  if (!tracks.length) return null;
+  const byLabel = (label) => tracks.find((t) => t.label === label && t.kind === 'external') || tracks.find((t) => t.label === label);
+  for (const label of [preferLabel, '简体中文', '中文', '繁體中文']) {
+    if (!label) continue;
+    const t = byLabel(label);
+    if (t) return t;
+  }
+  return tracks.find((t) => !t.image) || tracks[0];
+}
 export const mimeOf = (f) => MIME[extOf(f)] || 'video/mp4';
 export const HIDDEN = /^(\.|@eaDir$|\$RECYCLE\.BIN$|System Volume Information$|lost\+found$|#recycle$)/i;
 export const natural = (a, b) => a.localeCompare(b, 'zh-CN', { numeric: true, sensitivity: 'base' });
@@ -100,7 +198,7 @@ export function seekTarget({ value, relative = false, current = 0, duration = 0 
 
 export async function listLocalDir(dir) {
   const ents = await fsp.readdir(dir, { withFileTypes: true });
-  const dirs = []; const files = [];
+  const dirs = []; const files = []; const subs = [];
   await Promise.all(ents.map(async (e) => {
     if (HIDDEN.test(e.name)) return;
     const full = path.join(dir, e.name);
@@ -109,13 +207,15 @@ export async function listLocalDir(dir) {
       try { const st = await fsp.stat(full); isDir = st.isDirectory(); isFile = st.isFile(); } catch { return; }
     }
     if (isDir) dirs.push({ name: e.name });
+    else if (isFile && isSubFile(e.name)) subs.push(e.name);
     else if (isFile && isMedia(e.name)) {
       try { const st = await fsp.stat(full); files.push({ name: e.name, size: st.size, mtime: st.mtimeMs }); } catch { /* vanished */ }
     }
   }));
   dirs.sort((a, b) => natural(a.name, b.name));
   files.sort((a, b) => natural(a.name, b.name));
-  return { dirs, files };
+  subs.sort(natural);
+  return { dirs, files, subs };
 }
 
 /** Breadth-first name search under root. Paths returned are relative and prefixed with `prefix`. */

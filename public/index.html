@@ -22,6 +22,7 @@
       <button class="tab active" data-tab="files">文件</button>
       <button class="tab" data-tab="recent">最近播放</button>
       <button class="tab" data-tab="url">网络链接</button>
+      <button class="tab" data-tab="workers">Worker</button>
     </div>
 
     <div class="tabpane" id="tab-files">
@@ -37,6 +38,23 @@
       <ul id="recent" class="list"></ul>
     </div>
 
+    <div class="tabpane hidden" id="tab-workers">
+      <div class="wk-head">
+        <label>转码用
+          <select id="wk-select"></select>
+        </label>
+        <span id="wk-pick" class="dim"></span>
+        <button id="wk-add" class="primary">＋ 添加 worker</button>
+      </div>
+      <div id="wk-pair" class="wk-pair hidden">
+        <p>在要加入的那台机器上运行下面一条命令（<b id="wk-exp"></b> 内有效，用一次就失效）。它会安装 worker、检测显卡和 ffmpeg、设为开机自启，然后自动出现在下面。</p>
+        <div class="cmd"><span>Windows（PowerShell）</span><code id="wk-cmd-win"></code><button data-copy="wk-cmd-win">复制</button></div>
+        <div class="cmd"><span>macOS / Linux</span><code id="wk-cmd-sh"></code><button data-copy="wk-cmd-sh">复制</button></div>
+        <p class="dim">配对码：<b id="wk-code"></b>　需要 Node.js 20+；要转码还需要 ffmpeg（Windows 脚本会自动用 winget 安装）。树莓派本机不做解码。</p>
+      </div>
+      <div id="wk-list"></div>
+    </div>
+
     <div class="tabpane hidden" id="tab-url">
       <form id="urlform" class="urlform">
         <input id="url" type="url" placeholder="http(s)://… 视频直链或 m3u8" required>
@@ -50,6 +68,7 @@
 <footer class="player" id="player">
   <div class="np">
     <div class="np-title" id="np-title">未在播放</div>
+    <div class="np-worker hidden" id="np-worker"></div>
     <div class="np-sub" id="np-sub"></div>
   </div>
   <div class="seek">
@@ -72,6 +91,7 @@
     <button id="mute" title="静音">🔈</button>
     <input id="vol" type="range" min="0" max="100" step="1" value="50" aria-label="音量">
     <span id="volv" class="time">--</span>
+    <select id="sub" title="字幕" aria-label="字幕"><option value="off">字幕：关</option></select>
     <select id="mode" title="播放方式" aria-label="播放方式">
       <option value="auto">自动</option>
       <option value="direct">直连</option>

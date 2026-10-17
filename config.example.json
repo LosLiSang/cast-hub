@@ -1,12 +1,25 @@
 {
   "port": 8790,
   "autoNext": true,
-  "agentKey": "change-me",
-  "transcode": { "encoder": "auto", "maxHeight": 720 },
+  "transcode": {
+    "encoder": "auto",
+    "maxHeight": 720
+  },
   "roots": [
-    { "id": "anime", "name": "番剧", "path": "/mnt/data/downloads/番剧" },
-    { "id": "downloads", "name": "下载", "path": "/mnt/data/downloads" },
-    { "id": "media", "name": "媒体盘", "path": "/mnt/media" }
-  ],
-  "agents": []
+    {
+      "id": "anime",
+      "name": "番剧",
+      "path": "/mnt/data/downloads/番剧"
+    },
+    {
+      "id": "downloads",
+      "name": "下载",
+      "path": "/mnt/data/downloads"
+    },
+    {
+      "id": "media",
+      "name": "媒体盘",
+      "path": "/mnt/media"
+    }
+  ]
 }

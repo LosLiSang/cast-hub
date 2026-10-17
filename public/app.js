@@ -1,8 +1,10 @@
+import { initWorkers, loadWorkers, setPlayerDeps } from './workers.js';
+
 const $ = (s) => document.querySelector(s);
 const ui = {
   device: $('#device'), scan: $('#scan'), source: $('#source'), search: $('#search'), crumbs: $('#crumbs'), list: $('#list'),
   recent: $('#recent'), bar: $('#bar'), cur: $('#cur'), dur: $('#dur'), bubble: $('#bubble'), toggle: $('#toggle'),
-  vol: $('#vol'), volv: $('#volv'), mute: $('#mute'), mode: $('#mode'), title: $('#np-title'), sub: $('#np-sub'), toast: $('#toast'),
+  vol: $('#vol'), volv: $('#volv'), mute: $('#mute'), mode: $('#mode'), sub: $('#sub'), title: $('#np-title'), sub: $('#np-sub'), toast: $('#toast'),
 };
 const S = {
   device: localStorage.getItem('device') || '', source: localStorage.getItem('source') || '', path: localStorage.getItem('path') || '',
@@ -132,6 +134,8 @@ document.querySelectorAll('.tab').forEach((t) => {
     document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x === t));
     document.querySelectorAll('.tabpane').forEach((p) => p.classList.toggle('hidden', p.id !== `tab-${t.dataset.tab}`));
     if (t.dataset.tab === 'recent') loadRecent();
+    if (t.dataset.tab === 'workers') loadWorkers();
+    S.tab = t.dataset.tab;
   };
 });
 async function loadRecent() {
@@ -178,6 +182,7 @@ $('#jump').onclick = () => {
   optimisticSeek(t); control('seek', t);
 };
 ui.mode.onchange = () => { if (S.state?.item) control('mode', ui.mode.value); };
+ui.sub.onchange = () => { if (S.state?.item) { toast(ui.sub.value === 'off' ? '关闭字幕…' : '切换字幕…'); control('subtitle', ui.sub.value); } };
 
 // Seek bar: drag shows a preview bubble; release commits once.
 function setBar(pos, dur) {
@@ -230,6 +235,7 @@ function render(st) {
     const bits = [`${st.device.name}`, STATUS[st.status] || st.status];
     if (it) bits.push(MODE[st.mode] || st.mode);
     if (it?.video) bits.push(`${it.video.codec}${it.video.height ? ` ${it.video.height}p` : ''}`);
+    if (st.subState === 'working') bits.push('字幕准备中…');
     ui.sub.append(document.createTextNode(bits.join(' · ')));
     if (st.error) ui.sub.append(el('span', 'err', ` · ${st.error}`));
     else if (st.note) ui.sub.append(document.createTextNode(` · ${st.note}`));
@@ -239,7 +245,19 @@ function render(st) {
   if (!S.dragging && Date.now() > S.seekLockUntil) setBar(st.position, st.duration);
   if (!S.volDragging && st.volume != null) { ui.vol.value = st.volume; ui.volv.textContent = st.volume; }
   ui.mute.textContent = st.mute ? '🔇' : '🔈';
+  const npw = $('#np-worker');
+  if (it && st.worker) { npw.textContent = `⚙ ${st.worker.name}${st.encoder ? ` · ${st.encoder}` : ''} 转码中`; npw.classList.remove('hidden'); }
+  else npw.classList.add('hidden');
   if (it && st.requestedMode) ui.mode.value = st.requestedMode;
+  const subs = st.subtitles || [];
+  const sig = subs.map((t) => t.id).join('|');
+  if (ui.sub.dataset.sig !== sig) {
+    ui.sub.dataset.sig = sig; ui.sub.innerHTML = '';
+    ui.sub.append(new Option(subs.length ? '字幕：关' : '无字幕', 'off'));
+    for (const t of subs) ui.sub.append(new Option(`${t.label}${t.kind === 'external' ? '（外挂）' : '（内封）'}`, t.id));
+  }
+  if (document.activeElement !== ui.sub) ui.sub.value = st.subtitle || 'off';
+  ui.sub.disabled = !subs.length;
   const key = it ? `${it.source}|${it.path}` : '';
   if (key !== prevKey) document.querySelectorAll('.list li').forEach((li) => li.classList.remove('playing'));
   document.title = it && st.status === 'playing' ? `▶ ${it.title}` : '投屏中心';
@@ -257,6 +275,9 @@ setInterval(() => {
   setBar(st.position, st.duration);
 }, 1000);
 setInterval(() => { if (!document.hidden) poll(); }, 2500);
+setInterval(() => { if (!document.hidden && S.tab === 'workers') loadWorkers(); }, 10000);
+initWorkers({ api, toast });
+setPlayerDeps({ state: () => S.state, control });
 document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 
 (async () => {

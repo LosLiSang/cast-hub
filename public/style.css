@@ -68,7 +68,36 @@ input[type=range]:disabled { opacity: .4; }
 .controls2 input[type=range] { flex: 0 1 160px; }
 .toast { position: fixed; left: 50%; bottom: 250px; transform: translateX(-50%); background: #000d; padding: 8px 14px; border-radius: 10px; z-index: 9; max-width: 90vw; }
 .toast.err { background: #8b1e1ecc; }
+.dim { color: var(--dim); font-size: 13px; }
+.wk-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.wk-head label { display: flex; gap: 8px; align-items: center; }
+.wk-head .primary { margin-left: auto; }
+.wk-pair { background: #12141a; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin-bottom: 12px; }
+.wk-pair p { margin: 4px 0 8px; }
+.cmd { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; margin: 8px 0; align-items: center; }
+.cmd span { grid-column: 1 / -1; color: var(--dim); font-size: 12px; }
+.cmd code { background: #000; border-radius: 8px; padding: 8px 10px; font-size: 12px; overflow-x: auto; white-space: nowrap; user-select: all; }
+.wk { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; background: #191c22; }
+.wk.off { opacity: .6; }
+.wk-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.wk-name { font-weight: 600; font-size: 16px; }
+.badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #2a2e37; color: var(--dim); white-space: nowrap; }
+.badge.ok { background: #1d3b2a; color: #7ee2a8; }
+.badge.warn { background: #3b301d; color: #ffcf70; }
+.badge.bad { background: #3b1d1d; color: #ff9a9a; }
+.badge.sel { background: #1d2f4f; color: #9cc3ff; }
+.wk-meta { color: var(--dim); font-size: 13px; margin: 6px 0; }
+.wk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin: 8px 0; }
+.wk-grid label { display: grid; gap: 3px; font-size: 12px; color: var(--dim); }
+.wk-grid select, .wk-grid input { width: 100%; }
+.wk-roots { margin-top: 6px; }
+.wk-roots .root { display: grid; grid-template-columns: 110px 1fr auto; gap: 6px; margin: 4px 0; }
+.wk-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.wk-actions .danger { color: var(--err); }
+.np-worker { color: #9cc3ff; font-size: 12px; }
+.switch { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; font-size: 13px; }
 @media (max-width: 560px) {
+  .wk-roots .root { grid-template-columns: 1fr; }
   .top h1 { display: none; }
   .row { flex-direction: column; }
   .row select { flex: 1; }

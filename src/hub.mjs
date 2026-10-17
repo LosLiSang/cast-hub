@@ -12,9 +12,11 @@ import { fileURLToPath } from 'node:url';
 import {
   normRel, safeJoin, httpErr, listLocalDir, searchLocal, serveFile, sendJson, readJsonBody, mimeOf, isMedia,
   natural, siblingPath, estimatePosition, classifyStop, seekTarget, toSec, extOf,
+  findSidecars, embeddedTracks, pickDefaultSub, hubUrlFromHost, renderTemplate, VERSION,
 } from './lib.mjs';
+import { createWorkers } from './workers.mjs';
 import { discover, Renderer, localIpFor } from './upnp.mjs';
-import { chooseMode, fallbackMode, ffprobe, hasBinary, extForInput } from './media.mjs';
+import { chooseMode, fallbackMode, ffprobe, hasBinary, extForInput, dumpFonts, encoderLabel } from './media.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const APP_DIR = path.resolve(HERE, '..');
@@ -26,11 +28,11 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 // ---------------- config & persisted state ----------------
 const config = {
-  port: 8790, roots: [], agents: [], agentKey: '', autoNext: true,
+  port: 8790, roots: [], autoNext: true,
   ...JSON.parse(fs.existsSync(CONFIG_FILE) ? fs.readFileSync(CONFIG_FILE, 'utf8') : '{}'),
 };
 fs.mkdirSync(DATA_DIR, { recursive: true });
-const store = { lastDevice: null, history: {}, agents: {}, devices: [], ...(() => { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; } })() };
+const store = { lastDevice: null, history: {}, devices: [], ...(() => { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; } })() };
 let saveTimer = null;
 function persist() {
   clearTimeout(saveTimer);
@@ -40,6 +42,9 @@ function persist() {
     fs.renameSync(tmp, STATE_FILE);
   }, 1000);
 }
+
+delete store.agents; // pre-pairing registry
+const workers = createWorkers({ store, persist, log });
 
 // ---------------- capabilities ----------------
 const caps = { ffprobe: false };
@@ -78,32 +83,23 @@ function getDevice(id) {
 
 // ---------------- sources ----------------
 // local:<rootId>  -> folder on this machine
-// agent:<agentId>:<rootId> -> folder on a PC running cast-agent
-function agentsAll() {
-  const out = {};
-  for (const a of config.agents || []) out[a.id] = { ...a, static: true };
-  for (const [id, a] of Object.entries(store.agents || {})) out[id] = { ...out[id], ...a };
-  return out;
-}
-const agentOnline = (a) => !!a.lastSeen && Date.now() - a.lastSeen < 3 * 60e3;
-/** An online PC agent that can transcode, or null. */
-function pickTranscoder() {
-  return Object.values(agentsAll()).filter((a) => a.transcode && agentOnline(a)).sort((x, y) => y.lastSeen - x.lastSeen)[0] || null;
-}
-async function agentPost(agent, p, body, method = 'POST') {
+// agent:<workerId>:<rootId> -> folder shared by a worker
+const agentsAll = () => Object.fromEntries(workers.all().filter((w) => w.approved).map((w) => [w.id, w]));
+/** Worker for a transcode job (honours the user's choice), or null. */
+function pickTranscoder(sourceWorkerId) { return workers.pick(sourceWorkerId).worker; }
+async function agentPost(agent, p, body, method = 'POST', timeout = 30000) {
   const r = await fetch(`${agent.url}${p}`, {
     method, headers: { 'X-Cast-Token': agent.token, 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(30000),
+    body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(timeout),
   });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw httpErr(502, `电脑端 ${agent.name}：${data.error || r.status}`);
+  if (!r.ok) throw httpErr(r.status === 503 ? 503 : 502, `${agent.name}：${data.error || r.status}`);
   return data;
 }
 function sourcesList() {
   const list = (config.roots || []).map((r) => ({ id: `local:${r.id}`, name: r.name, kind: 'local', online: fs.existsSync(r.path) }));
   for (const a of Object.values(agentsAll())) {
-    const online = agentOnline(a);
-    for (const r of a.roots || []) list.push({ id: `agent:${a.id}:${r.id}`, name: `${a.name} · ${r.name}`, kind: 'agent', online: online || !!a.static });
+    for (const r of a.roots || []) list.push({ id: `agent:${a.id}:${r.id}`, name: `${a.name} · ${r.name}`, kind: 'agent', online: a.online });
   }
   return list;
 }
@@ -116,7 +112,8 @@ function parseSource(id) {
   }
   if (kind === 'agent') {
     const agent = agentsAll()[a];
-    if (!agent) throw httpErr(404, '电脑端没有在线');
+    if (!agent) throw httpErr(404, '这台 worker 不存在或未批准');
+    if (!agent.online) throw httpErr(503, `${agent.name} 不在线`);
     return { kind, agent, rootId: b };
   }
   throw httpErr(400, '未知的来源');
@@ -125,9 +122,9 @@ async function agentFetch(agent, p) {
   const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 8000);
   try {
     const r = await fetch(`${agent.url}${p}`, { headers: { 'X-Cast-Token': agent.token }, signal: ctrl.signal });
-    if (!r.ok) throw httpErr(r.status === 404 ? 404 : 502, `电脑端返回 ${r.status}`);
+    if (!r.ok) throw httpErr(r.status === 404 ? 404 : 502, `${agent.name} 返回 ${r.status}`);
     return await r.json();
-  } catch (e) { if (e.status) throw e; throw httpErr(502, `连不上电脑端 ${agent.name}（${e.name === 'AbortError' ? '超时' : e.message}）`); }
+  } catch (e) { if (e.status) throw e; throw httpErr(502, `连不上 ${agent.name}（${e.name === 'AbortError' ? '超时' : e.message}）`); }
   finally { clearTimeout(t); }
 }
 const encPath = (rel) => normRel(rel).split('/').map(encodeURIComponent).join('/');
@@ -175,11 +172,12 @@ class Session {
     this.status = 'idle'; this.item = null; this.error = null; this.note = null;
     this.mode = 'direct'; this.requestedMode = 'auto'; this.offset = 0; this.gen = 0;
     this.job = null; this.token = null; this.chain = Promise.resolve();
+    this.subs = []; this.subId = 'off'; this.subState = null; this.subKey = null;
     this.transport = ''; this.relTime = 0; this.rendererDuration = 0;
     this.volume = null; this.mute = false; this.failures = 0; this.timer = null;
     this.resetClock();
   }
-  resetClock() { this.loadAt = Date.now(); this.everPlayed = false; this.playedMs = 0; this.lastTick = 0; this.relTime = 0; this.graceUntil = Date.now() + 6000; }
+  resetClock() { this.nudged = false; this.userPaused = false; this.loadAt = Date.now(); this.everPlayed = false; this.playedMs = 0; this.lastTick = 0; this.relTime = 0; this.graceUntil = Date.now() + 6000; }
   get duration() { return this.item?.probe?.duration || this.rendererDuration || 0; }
   get position() {
     let played = this.playedMs;
@@ -201,15 +199,31 @@ class Session {
       if (this.item.directUrl) return this.item.directUrl;
       return `http://${this.host()}:${config.port}/m/${this.token}/${encodeURIComponent(this.item.title)}`;
     }
-    const agent = pickTranscoder();
-    if (!agent) throw httpErr(503, '需要转码，但电脑端没有在线（树莓派不做解码）');
-    const job = await agentPost(agent, '/api/transcode', { ...this.transcodeSpec(agent), offset: this.offset, mode: this.mode, replace: this.job?.id });
-    this.job = { agent, id: job.id };
+    const agent = this.worker && workers.all().find((w) => w.id === this.worker.id && w.online) ? this.worker : pickTranscoder(this.item.agentId);
+    if (!agent) throw httpErr(503, '需要转码，但没有可用的 worker（树莓派不做解码）。到「Worker」页添加或启用一台');
+    let sub;
+    const t = this.subTrack();
+    if (t?.image) sub = { overlay: t.n };
+    else if (t && this.subState === 'ready') sub = { key: this.subKey };
+    this.loadedSubKey = sub?.key || null;
+    // The worker picks family/codec from its own prefs. sourceCodec lets it choose HEVC 10-bit when the
+    // renderer evidently decodes HEVC; safe=true (renderer refused the source) forces H.264.
+    const replace = this.job && this.job.agent.id === agent.id ? this.job.id : undefined;
+    if (this.job && !replace) this.killProcs();
+    const job = await agentPost(agent, '/api/transcode', {
+      ...this.transcodeSpec(agent), offset: this.offset, mode: this.mode, replace, sub,
+      sourceCodec: this.item.probe?.video?.codec, safe: !!this.fellBack,
+    });
+    if (!replace) workers.busy[agent.id] = (workers.busy[agent.id] || 0) + 1;
+    this.job = { agent, id: job.id }; this.worker = agent; this.encoder = job.encoder || null;
     return `${agent.url}${job.url}`;
   }
   killProcs() {
     const j = this.job; this.job = null;
-    if (j) agentPost(j.agent, `/api/transcode/${j.id}`, null, 'DELETE').catch(() => {});
+    if (j) {
+      workers.busy[j.agent.id] = Math.max(0, (workers.busy[j.agent.id] || 1) - 1);
+      agentPost(j.agent, `/api/transcode/${j.id}`, null, 'DELETE').catch(() => {});
+    }
   }
 
   async start(item, { mode = 'auto', start = 0 } = {}) {
@@ -217,17 +231,158 @@ class Session {
     if (this.token) byToken.delete(this.token);
     this.token = crypto.randomBytes(8).toString('hex'); byToken.set(this.token, this);
     this.item = item; this.requestedMode = mode; this.error = null; this.note = null; this.rendererDuration = 0;
+    if (this.subsFor !== item.key) this.fellBack = false;
     this.status = 'loading';
     if (!item.probe) item.probe = await this.probe(item);
-    const tc = pickTranscoder();
+    const tc = pickTranscoder(item.agentId);
+    this.worker = tc;
+    // Subtitle: keep the current choice when re-starting the same item, else pick by preference.
+    const sameItem = this.subsFor === item.key;
+    if (!sameItem) {
+      this.subs = await subtitleTracks(item);
+      this.subsFor = item.key;
+      const want = store.subPref === 'off' ? null : pickDefaultSub(this.subs, store.subPref);
+      this.subId = want ? want.id : 'off';
+      this.subState = null; this.subKey = null;
+    }
+    const burning = this.subId !== 'off';
+    let prep = null;
+    if (burning && tc && !this.subTrack()?.image && this.subState !== 'ready') {
+      // Wait briefly (sidecar files / cache are fast) so the first load already has subtitles.
+      this.prepInline = true;
+      prep = this.prepareSubtitle(tc).catch(() => {});
+      await Promise.race([prep, new Promise((r) => setTimeout(r, 6000))]);
+      this.prepInline = false;
+    }
     let m;
     if (mode === 'direct') m = { mode: 'direct', reason: '手动选择直连' };
-    else if (mode === 'transcode') m = { mode: 'video', reason: `手动选择转码（${tc ? tc.name : '电脑端不在线'}）` };
+    else if (mode === 'transcode') m = { mode: 'video', reason: '手动选择转码' };
+    else if (burning && tc) m = { mode: 'video', reason: '字幕烧录进画面' };
     else m = chooseMode(item.probe, { ext: item.ext, isUrl: item.source === 'url' });
-    if (m.mode !== 'direct' && !tc) m = { mode: 'direct', reason: `${m.reason}；电脑端不在线，先直连尝试` };
-    else if (m.mode !== 'direct') m.reason += `，由 ${tc.name} 转码`;
+    if (m.mode !== 'direct' && !tc) m = { mode: 'direct', reason: `${m.reason}；没有可用的 worker，先直连尝试` };
     this.note = m.reason;
     await this.load(m.mode, start);
+    if (prep && this.subState !== 'ready' && this.subState !== 'error') {
+      this.note = '字幕准备中，就绪后自动加上';
+      const key = item.key;
+      prep.then(() => this.run(async () => {
+        if (this.item?.key === key && this.mode === 'video' && this.subState === 'ready' && this.loadedSubKey !== this.subKey) await this.load('video', this.position);
+      }));
+    }
+  }
+
+  subTrack() { return this.subId === 'off' ? null : this.subs.find((t) => t.id === this.subId) || null; }
+
+  /**
+   * Ask the transcoding PC to prepare the chosen text subtitle (+ embedded fonts). Extraction of an
+   * embedded track has to read the whole file once, so it runs in the background; playback starts
+   * immediately and the stream is restarted with subtitles as soon as they are ready.
+   */
+  async prepareSubtitle(agent) {
+    const t = this.subTrack();
+    if (!t || t.image) { this.subState = t ? 'ready' : null; return; }
+    const item = this.item;
+    const key = crypto.createHash('sha1').update(`${item.key}|${t.id}`).digest('hex').slice(0, 24);
+    this.subKey = key;
+    const spec = { key };
+    const sameAgent = item.agentId && item.agentId === agent.id;
+    if (t.kind === 'external') {
+      const parent = path.posix.dirname(item.path);
+      const subRel = parent === '.' ? t.name : `${parent}/${t.name}`;
+      if (sameAgent) spec.input = { root: item.agentRoot, path: item.path }, spec.sidecar = { root: item.agentRoot, path: subRel };
+      else spec.download = [{ name: `sub${extOf(t.name)}`, url: this.subFileUrl(agent, subRel) }];
+      if (spec.download || spec.sidecar) spec.attachments = item.probe?.attachments || [];
+      if (spec.download) spec.download.push(...(await this.fontDownloads(agent)));
+    } else {
+      spec.input = sameAgent ? { root: item.agentRoot, path: item.path } : this.transcodeSpec(agent);
+      spec.embedded = { n: t.n, codec: t.codec };
+      spec.attachments = item.probe?.attachments || [];
+    }
+    // External sidecar on the same PC: let the agent dump fonts from the video itself.
+    if (spec.sidecar) spec.attachments = item.probe?.attachments || [];
+    this.subState = 'working';
+    const startedFor = `${item.key}|${t.id}`;
+    for (let i = 0; i < 240; i++) {
+      let r;
+      try { r = await agentPost(agent, '/api/subprep', spec); } catch (e) { r = { state: 'error', error: e.message }; }
+      if (`${this.item?.key}|${this.subId}` !== startedFor) return; // user moved on
+      if (r.state === 'ready') {
+        this.subState = 'ready';
+        this.note = '字幕已就绪';
+        // Background completion: restart the stream with subtitles if it is still running without them.
+        // Queued on the session chain so it can never race a user-triggered load.
+        if (!this.prepInline) {
+          await this.run(async () => {
+            if (this.mode === 'video' && this.item && this.loadedSubKey !== this.subKey) await this.load('video', this.position);
+          });
+        }
+        return;
+      }
+      if (r.state === 'error') { this.subState = 'error'; this.note = `字幕准备失败：${r.error}`; return; }
+      // Sidecar copies finish in well under a second: poll fast first so the caller loads only once.
+      await new Promise((res) => setTimeout(res, i < 10 ? 300 : 2500));
+      delete spec.download; // already handed over; just poll
+    }
+    this.subState = 'error'; this.note = '字幕准备超时';
+  }
+
+  /** URL the PC can fetch a sidecar subtitle from (Pi file server or the source PC). */
+  subFileUrl(agent, subRel) {
+    const it = this.item;
+    if (it.agentId) {
+      const a = agentsAll()[it.agentId];
+      return `${a.url}/sub/${a.token}/${encodeURIComponent(it.agentRoot)}/${encPath(subRel)}`;
+    }
+    const s = parseSource(it.source);
+    const tok = crypto.randomBytes(8).toString('hex');
+    subFiles.set(tok, { file: safeJoin(s.root.path, subRel), expires: Date.now() + 10 * 60e3 });
+    return `http://${localIpFor(new URL(agent.url).hostname)}:${config.port}/s/${tok}`;
+  }
+
+  /** Embedded fonts for an external .ass that styles with them: Pi dumps them (stream copy, no decode). */
+  async fontDownloads(agent) {
+    const it = this.item;
+    if (it.agentId || !it.probe?.attachments?.length || !caps.ffprobe) return [];
+    const dir = path.join(DATA_DIR, 'fonts', crypto.createHash('sha1').update(it.key).digest('hex').slice(0, 16));
+    await fsp.mkdir(dir, { recursive: true });
+    const names = await dumpFonts(it.input, it.probe.attachments, dir);
+    return names.map((n) => {
+      const tok = crypto.randomBytes(8).toString('hex');
+      subFiles.set(tok, { file: path.join(dir, n), expires: Date.now() + 10 * 60e3 });
+      return { name: `fonts/${n}`, url: `http://${localIpFor(new URL(agent.url).hostname)}:${config.port}/s/${tok}` };
+    });
+  }
+
+  async setSubtitle(id) {
+    if (!this.item) throw httpErr(409, '当前没有在播放');
+    if (id !== 'off' && !this.subs.find((t) => t.id === id)) throw httpErr(404, '没有这个字幕');
+    this.subId = id; this.subState = null; this.subKey = null;
+    store.subPref = id === 'off' ? 'off' : this.subTrack().label; persist();
+    const tc = this.worker || pickTranscoder(this.item.agentId);
+    if (id === 'off') {
+      // Back to whatever the format needs (often direct).
+      const m = this.requestedMode === 'transcode' ? 'video' : chooseMode(this.item.probe, { ext: this.item.ext, isUrl: this.item.source === 'url' }).mode;
+      this.note = '已关闭字幕';
+      return this.load(m !== 'direct' && !tc ? 'direct' : m, this.position);
+    }
+    if (!tc) throw httpErr(503, '显示字幕需要一台可用的 worker（树莓派不做解码）');
+    this.note = this.subTrack().image ? '字幕烧录进画面' : '正在准备字幕…';
+    if (this.subTrack().image) return this.load('video', this.position);
+    // Give a cached subtitle a moment to come back so we load exactly once; a slow extraction
+    // finishes in the background and reloads itself.
+    this.prepInline = true;
+    const prep = this.prepareSubtitle(tc).catch(() => {});
+    await Promise.race([prep, new Promise((r) => setTimeout(r, 4000))]);
+    this.prepInline = false;
+    const want = this.subState === 'ready' ? this.subKey : null;
+    log(`[${this.dev.name}] subtitle -> ${id} state=${this.subState} loaded=${this.loadedSubKey} want=${want}`);
+    if (this.mode !== 'video' || this.loadedSubKey !== want || want === null) await this.load('video', this.position);
+    if (this.subState !== 'ready' && this.subState !== 'error') {
+      // Still extracting: when it lands, reload with it.
+      prep.then(() => this.run(async () => {
+        if (this.mode === 'video' && this.subState === 'ready' && this.loadedSubKey !== this.subKey) await this.load('video', this.position);
+      }));
+    }
   }
 
   /** Header-only probe. Pi-local files use the Pi's ffprobe (cheap); PC files are probed on the PC. */
@@ -235,7 +390,7 @@ class Session {
     try {
       if (item.agentId) {
         const a = agentsAll()[item.agentId];
-        if (a?.transcode) return (await agentPost(a, '/api/probe', { root: item.agentRoot, path: item.path })).probe;
+        if (a?.transcode && a.online) return (await agentPost(a, '/api/probe', { root: item.agentRoot, path: item.path })).probe;
       }
       if (caps.ffprobe) return await ffprobe(item.input, item.source === 'url' ? 30000 : 20000);
     } catch (e) { log('probe failed', e.message); }
@@ -244,12 +399,14 @@ class Session {
 
   async load(mode, offset) {
     this.mode = mode; this.offset = mode === 'direct' ? 0 : Math.max(0, Math.floor(offset || 0)); this.gen++;
-    if (mode === 'direct') this.killProcs();
-    this.resetClock(); this.status = 'loading';
-    const url = await this.mediaUrl();
-    this.currentUrl = url;
-    log(`[${this.dev.name}] load mode=${mode} offset=${this.offset} ${this.item.title}`);
-    await this.r.load(url, { title: this.item.title, mime: mode === 'direct' ? this.item.mime : 'video/mp2t' });
+    if (mode === 'direct') { this.killProcs(); this.loadedSubKey = null; }
+    this.resetClock(); this.status = 'loading'; this.loading = true; this.error = null;
+    try {
+      const url = await this.mediaUrl();
+      this.currentUrl = url;
+      log(`[${this.dev.name}] load mode=${mode} offset=${this.offset} sub=${this.loadedSubKey || '-'} ${this.item.title}`);
+      await this.r.load(url, { title: this.item.title, mime: mode === 'direct' ? this.item.mime : 'video/mp2t' });
+    } finally { this.loading = false; }
     this.pendingDirectSeek = mode === 'direct' && offset > 0 ? Math.floor(offset) : 0;
     this.ensurePolling();
   }
@@ -280,7 +437,11 @@ class Session {
       if (this.relTime > 0 || this.playedMs > 3000) this.everPlayed = true;
       this.status = 'playing';
       if (this.pendingDirectSeek && this.relTime > 0) { const t = this.pendingDirectSeek; this.pendingDirectSeek = 0; this.run(() => this.seekTo(t)); }
-    } else if (st.transport === 'PAUSED_PLAYBACK') { this.status = 'paused'; this.everPlayed = true; }
+    } else if (st.transport === 'PAUSED_PLAYBACK') {
+      // Some renderers land in PAUSED after a load/seek even though Play was sent; nudge them once.
+      if (!this.userPaused && now < this.loadAt + 20000 && !this.nudged) { this.nudged = true; this.r.play().catch(() => {}); }
+      this.status = 'paused'; this.everPlayed = true;
+    }
     else if (st.transport === 'TRANSITIONING') { this.status = 'loading'; }
     else if (st.transport === 'STOPPED' || st.transport === 'NO_MEDIA_PRESENT') {
       if (this.status === 'stopped' || this.status === 'idle') return;
@@ -303,8 +464,9 @@ class Session {
   }
 
   async onFailed() {
-    const next = this.requestedMode === 'auto' && pickTranscoder() ? fallbackMode(this.mode, this.item.probe) : null;
+    const next = this.requestedMode === 'auto' && pickTranscoder(this.item.agentId) ? fallbackMode(this.mode, this.item.probe) : null;
     if (next) {
+      this.fellBack = true;
       this.note = next === 'video' ? '设备无法直接播放，已自动转码' : '设备无法直接播放，已自动转换音频/封装';
       log(`[${this.dev.name}] fallback ${this.mode} -> ${next}`);
       return this.load(next, this.mode === 'direct' ? 0 : this.offset);
@@ -334,9 +496,10 @@ class Session {
         try {
           await this.r.seek(target);
           this.relTime = target; this.graceUntil = Date.now() + 4000; this.lastTick = Date.now();
+          this.loadAt = Date.now(); this.nudged = false;
           return;
         } catch (e) {
-          if (!pickTranscoder()) throw httpErr(502, `设备不支持跳转：${e.message}`);
+          if (!pickTranscoder(this.item.agentId)) throw httpErr(502, `设备不支持跳转：${e.message}`);
           this.note = '设备不支持直接跳转，已切换为流式播放';
           await this.load(this.item.probe?.video && ['h264', 'hevc'].includes(this.item.probe.video.codec) ? 'remux' : 'video', target);
           return;
@@ -360,12 +523,14 @@ class Session {
 
   /** Freeze the wall clock at pause so streamed positions don't drift. */
   async pause() {
+    this.userPaused = true;
     await this.r.pause();
     if (this.transport === 'PLAYING' && this.lastTick) this.playedMs += Date.now() - this.lastTick;
     this.lastTick = Date.now(); this.transport = 'PAUSED_PLAYBACK'; this.status = 'paused';
     this.recordHistory(false);
   }
   async resume() {
+    this.userPaused = false;
     await this.r.play();
     this.lastTick = Date.now(); this.transport = 'PLAYING'; this.status = 'playing'; this.ensurePolling();
   }
@@ -390,6 +555,10 @@ class Session {
       mode: this.mode, requestedMode: this.requestedMode,
       position: Math.floor(this.position), duration: Math.floor(this.duration),
       seekable: !!it, volume: this.volume, mute: this.mute,
+      subtitles: this.subs.map((t) => ({ id: t.id, label: t.label, kind: t.kind, codec: t.codec })),
+      subtitle: this.subId, subState: this.subState,
+      worker: this.mode !== 'direct' && this.job ? { id: this.job.agent.id, name: this.job.agent.name } : null,
+      encoder: this.mode === 'video' && this.job ? encoderLabel(this.encoder) : null,
       item: it ? {
         title: it.title, source: it.source, path: it.path,
         video: it.probe?.video || null, audio: it.probe?.audio || null,
@@ -397,6 +566,19 @@ class Session {
     };
   }
 }
+// One-shot file tokens the transcoding PC uses to fetch subtitles/fonts from the Pi.
+const subFiles = new Map();
+setInterval(() => { const now = Date.now(); for (const [k, v] of subFiles) if (v.expires < now) subFiles.delete(k); }, 60e3).unref();
+
+/** All subtitle tracks for an item: sidecar files next to it, then embedded streams. */
+async function subtitleTracks(item) {
+  if (item.source === 'url') return embeddedTracks(item.probe);
+  const parent = path.posix.dirname(item.path);
+  let names = [];
+  try { names = (await listSource(item.source, parent === '.' ? '' : parent)).subs || []; } catch { /* ignore */ }
+  return [...findSidecars(item.title, names), ...embeddedTracks(item.probe)];
+}
+
 function sessionFor(deviceId) {
   const dev = getDevice(deviceId);
   let s = sessions.get(dev.id);
@@ -415,8 +597,7 @@ async function handleMedia(req, res, token) {
 // ---------------- API ----------------
 const routes = {
   'GET /api/info': async () => {
-    const tc = pickTranscoder();
-    return { caps, transcoder: tc ? { name: tc.name, encoder: tc.encoder } : null, autoNext: config.autoNext, lastDevice: store.lastDevice };
+    return { caps, version: VERSION, transcoder: pickView(), autoNext: config.autoNext, lastDevice: store.lastDevice };
   },
   'GET /api/devices': async () => ({ scanning: !!scanning, lastDevice: store.lastDevice, devices: deviceList() }),
   'POST /api/devices/scan': async () => { await scan(); return { lastDevice: store.lastDevice, devices: deviceList() }; },
@@ -456,24 +637,72 @@ const routes = {
         case 'volume': await s.r.setVolume(Number(v)); s.volume = Number(v); break;
         case 'mute': await s.r.setMute(!!v); s.mute = !!v; break;
         case 'mode': if (!s.item) throw httpErr(409, '当前没有在播放'); await s.start(s.item, { mode: v, start: s.position }); break;
+        case 'subtitle': await s.setSubtitle(String(v)); break;
+        case 'restream': if (s.item && s.mode !== 'direct') { s.worker = null; await s.load(s.mode, s.position); } break;
         default: throw httpErr(400, '未知操作');
       }
     });
     if (body.action === 'volume' || body.action === 'mute') await s.refreshVolume();
     return s.view();
   },
-  'POST /api/agents/announce': async (_q, body, req) => {
-    if (!config.agentKey || body.key !== config.agentKey) throw httpErr(403, 'agent key 不正确');
-    if (!body.id || !body.url || !body.token) throw httpErr(400, '缺少字段');
-    store.agents[body.id] = {
-      id: String(body.id), name: String(body.name || body.id), url: String(body.url).replace(/\/$/, ''), token: String(body.token),
-      roots: (body.roots || []).map((r) => ({ id: String(r.id), name: String(r.name) })), lastSeen: Date.now(), from: req.socket.remoteAddress,
-      transcode: !!body.transcode, encoder: String(body.encoder || ''),
-    };
-    persist();
-    return { ok: true };
+  // ---- workers ----
+  'GET /api/workers': async () => ({ select: workers.selected(), hubVersion: VERSION, workers: workers.list(), pick: pickView() }),
+  'POST /api/workers/paircode': async () => workers.newPairCode(),
+  'POST /api/workers/pair': async (_q, body, req) => workers.pair(body, req.socket.remoteAddress),
+  'POST /api/workers/heartbeat': async (_q, body, req) => workers.heartbeat(req, body),
+  'POST /api/workers/update': async (_q, body) => workers.update(String(body.id), body),
+  'POST /api/workers/remove': async (_q, body) => { workers.remove(String(body.id)); return { ok: true }; },
+  'POST /api/workers/select': async (_q, body) => { workers.select(String(body.id || 'auto')); return { select: workers.selected(), pick: pickView() }; },
+  'POST /api/workers/bench': async (_q, body) => {
+    const w = workers.get(String(body.id));
+    if (!workers.all().find((x) => x.id === w.id)?.online) throw httpErr(503, `${w.name} 不在线`);
+    const r = await agentPost(w, '/api/bench', {}, 'POST', 300000);
+    store.workers[w.id].bench = r; persist();
+    return r;
   },
+
 };
+
+function pickView() {
+  const r = workers.pick();
+  return r.worker ? { id: r.worker.id, name: r.worker.name, reason: r.reason } : { id: null, reason: 'none' };
+}
+
+// ---------------- worker install ----------------
+// GET /install/worker.ps1?code=XXXXXX | /install/worker.sh?code=XXXXXX | /install/worker.tar
+const INSTALL_DIR = path.join(APP_DIR, 'install');
+const WORKER_FILES = ['src/agent.mjs', 'src/lib.mjs', 'src/media.mjs', 'src/upnp.mjs', 'package.json'];
+/** Minimal ustar archive (no deps) of a few small files. */
+function tarFiles(files) {
+  const blocks = [];
+  const oct = (n, w) => n.toString(8).padStart(w - 1, '0') + '\0';
+  for (const rel of files) {
+    const data = fs.readFileSync(path.join(APP_DIR, rel));
+    const h = Buffer.alloc(512);
+    h.write(rel, 0, 100, 'utf8');
+    h.write(oct(0o644, 8), 100); h.write(oct(0, 8), 108); h.write(oct(0, 8), 116);
+    h.write(oct(data.length, 12), 124); h.write(oct(Math.floor(Date.now() / 1000), 12), 136);
+    h.write('        ', 148); h.write('0', 156); h.write('ustar\0', 257); h.write('00', 263);
+    let sum = 0; for (const b of h) sum += b;
+    h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
+    blocks.push(h, data, Buffer.alloc((512 - (data.length % 512)) % 512));
+  }
+  blocks.push(Buffer.alloc(1024));
+  return Buffer.concat(blocks);
+}
+async function serveInstall(req, res, name, q) {
+  if (name === 'worker.tar') {
+    const body = tarFiles(WORKER_FILES);
+    res.writeHead(200, { 'Content-Type': 'application/x-tar', 'Content-Length': body.length });
+    return res.end(body);
+  }
+  const code = String(q.code || '').toUpperCase();
+  if (code && !/^[A-Z0-9]{6}$/.test(code)) throw httpErr(400, 'bad code');
+  const hub = hubUrlFromHost(req.headers.host, `http://localhost:${config.port}`);
+  const body = renderTemplate(await fsp.readFile(path.join(INSTALL_DIR, name), 'utf8'), { HUB: hub, CODE: code, VERSION });
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(body);
+}
 
 async function serveStatic(req, res, pathname) {
   const rel = pathname === '/' ? 'index.html' : pathname.slice(1);
@@ -492,6 +721,12 @@ const server = http.createServer(async (req, res) => {
   try {
     let m;
     if ((m = u.pathname.match(/^\/m\/([a-f0-9]+)\//))) return await handleMedia(req, res, m[1]);
+    if ((m = u.pathname.match(/^\/s\/([a-f0-9]+)$/))) {
+      const f = subFiles.get(m[1]);
+      if (!f) { res.writeHead(404); return res.end(); }
+      return await serveFile(req, res, f.file, 'application/octet-stream');
+    }
+    if ((m = u.pathname.match(/^\/install\/(worker\.(?:ps1|sh|tar))$/))) return await serveInstall(req, res, m[1], Object.fromEntries(u.searchParams));
     const key = `${req.method} ${u.pathname}`;
     const route = routes[key];
     if (route) {
