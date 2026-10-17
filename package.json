@@ -1,0 +1,13 @@
+{
+  "name": "cast-hub",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "LAN DLNA casting hub with a web remote (browse folders/PC/URL, seek, volume, auto-transcode)",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/hub.mjs",
+    "agent": "node src/agent.mjs",
+    "test": "node --test test/pure.test.mjs"
+  }
+}

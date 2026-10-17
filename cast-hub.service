@@ -1,0 +1,17 @@
+[Unit]
+Description=cast-hub DLNA casting web remote
+After=network-online.target mnt-data.mount
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lisang
+WorkingDirectory=/opt/cast-hub
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /opt/cast-hub/src/hub.mjs
+Restart=on-failure
+RestartSec=3
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

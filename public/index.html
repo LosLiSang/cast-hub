@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14161b">
+<title>投屏中心</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top">
+  <h1>投屏中心</h1>
+  <div class="devbar">
+    <select id="device" aria-label="播放设备"></select>
+    <button id="scan" class="icon" title="重新搜索设备" aria-label="重新搜索设备">⟳</button>
+  </div>
+</header>
+
+<main>
+  <section class="panel" id="browser">
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-tab="files">文件</button>
+      <button class="tab" data-tab="recent">最近播放</button>
+      <button class="tab" data-tab="url">网络链接</button>
+    </div>
+
+    <div class="tabpane" id="tab-files">
+      <div class="row">
+        <select id="source" aria-label="视频来源"></select>
+        <input id="search" type="search" placeholder="搜索当前来源…" autocomplete="off">
+      </div>
+      <nav id="crumbs" class="crumbs"></nav>
+      <ul id="list" class="list"></ul>
+    </div>
+
+    <div class="tabpane hidden" id="tab-recent">
+      <ul id="recent" class="list"></ul>
+    </div>
+
+    <div class="tabpane hidden" id="tab-url">
+      <form id="urlform" class="urlform">
+        <input id="url" type="url" placeholder="http(s)://… 视频直链或 m3u8" required>
+        <input id="urltitle" type="text" placeholder="标题（可选）">
+        <button type="submit" class="primary">投放</button>
+      </form>
+    </div>
+  </section>
+</main>
+
+<footer class="player" id="player">
+  <div class="np">
+    <div class="np-title" id="np-title">未在播放</div>
+    <div class="np-sub" id="np-sub"></div>
+  </div>
+  <div class="seek">
+    <span id="cur" class="time">00:00</span>
+    <input id="bar" type="range" min="0" max="0" value="0" step="1" aria-label="播放进度">
+    <span id="dur" class="time">00:00</span>
+    <div id="bubble" class="bubble hidden"></div>
+  </div>
+  <div class="controls">
+    <button data-act="prev" title="上一集" aria-label="上一集">⏮</button>
+    <button data-rel="-30" title="后退 30 秒">-30</button>
+    <button data-rel="-10" title="后退 10 秒">-10</button>
+    <button data-act="toggle" id="toggle" class="big" title="播放/暂停" aria-label="播放/暂停">▶</button>
+    <button data-rel="30" title="前进 30 秒">+30</button>
+    <button data-rel="90" title="前进 90 秒（跳片头）">+90</button>
+    <button data-act="next" title="下一集" aria-label="下一集">⏭</button>
+  </div>
+  <div class="controls2">
+    <button data-act="stop" title="停止">■ 停止</button>
+    <button id="mute" title="静音">🔈</button>
+    <input id="vol" type="range" min="0" max="100" step="1" value="50" aria-label="音量">
+    <span id="volv" class="time">--</span>
+    <select id="mode" title="播放方式" aria-label="播放方式">
+      <option value="auto">自动</option>
+      <option value="direct">直连</option>
+      <option value="transcode">转码</option>
+    </select>
+    <button id="jump" title="跳到指定时间">⏱ 跳转</button>
+  </div>
+</footer>
+
+<div id="toast" class="toast hidden" role="status"></div>
+<script type="module" src="/app.js"></script>
+</body>
+</html>
